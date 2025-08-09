@@ -14,7 +14,8 @@ import { tmpdir } from 'os';
 import { format } from 'util';
 import pino from 'pino';
 import { Boom } from '@hapi/boom';
-import { makeWASocket, protoType, serialize } from './lib/simple.js';
+import { makeWASocket } from './lib/simple.js';
+import { initializeErrorSystem, cleanOldLogs } from './lib/error-system.js';
 import { Low, JSONFile } from 'lowdb';
 import lodash from 'lodash';
 import readline from 'readline';
@@ -141,12 +142,33 @@ const connectionOptions = {
 
 global.conn = makeWASocket(connectionOptions);
 
+// Inicializar sistema de monitoreo de errores
+initializeErrorSystem();
+
+// Limpiar logs antiguos al inicio
+cleanOldLogs();
+
 /**
  * Función para reconectar un sub-bot y asignarle un manejador de mensajes.
  * @param {string} botPath - Ruta completa a la carpeta de sesión del sub-bot.
  */
-async function reconnectSubBot(botPath) {
-    console.log(chalk.yellow(`Intentando reconectar sub-bot en: ${path.basename(botPath)}`));
+/**
+ * Función para reconectar un sub-bot y asignarle un manejador de mensajes.
+ * @param {string} botPath - Ruta completa a la carpeta de sesión del sub-bot.
+ * @param {string} priority - Prioridad del sub-bot: 'vip' o 'free'
+ * @param {number} delay - Retraso antes de la reconexión en ms
+ */
+async function reconnectSubBot(botPath, priority = 'free', delay = 0) {
+    const botNumber = path.basename(botPath);
+    const priorityIcon = priority === 'vip' ? '💎' : '🆓';
+
+    if (delay > 0) {
+        console.log(chalk.cyan(`⏰ Esperando ${delay/1000}s para reconectar ${priorityIcon} sub-bot: ${botNumber}`));
+        await new Promise(resolve => setTimeout(resolve, delay));
+    }
+
+    console.log(chalk.yellow(`${priorityIcon} Intentando reconectar sub-bot ${priority.toUpperCase()}: ${botNumber}`));
+
     try {
         const { state: subBotState, saveCreds: saveSubBotCreds } = await useMultiFileAuthState(botPath);
         const subBotConn = makeWASocket({
@@ -157,13 +179,18 @@ async function reconnectSubBot(botPath) {
                 creds: subBotState.creds,
                 keys: makeCacheableSignalKeyStore(subBotState.keys, logger),
             },
-            browser: Browsers.ubuntu('Chrome'),
+            browser: priority === 'vip' ?
+                ['Premium VIP Bot', 'Chrome', '2.0.0'] :
+                ['Free Bot', 'Chrome', '1.0.0'],
             markOnlineOnclientect: false,
-            generateHighQualityLinkPreview: true,
-            syncFullHistory: true,
-            retryRequestDelayMs: 10,
-            transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 10 },
-            maxMsgRetryCount: 15,
+            generateHighQualityLinkPreview: priority === 'vip',
+            syncFullHistory: priority === 'vip',
+            retryRequestDelayMs: priority === 'vip' ? 5 : 15,
+            transactionOpts: {
+                maxCommitRetries: priority === 'vip' ? 15 : 5,
+                delayBetweenTriesMs: priority === 'vip' ? 5 : 15
+            },
+            maxMsgRetryCount: priority === 'vip' ? 20 : 10,
             appStateMacVerification: {
                 patch: false,
                 snapshot: false,
@@ -178,34 +205,121 @@ async function reconnectSubBot(botPath) {
         subBotConn.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect } = update;
             if (connection === 'open') {
-                console.log(chalk.green(`Sub-bot conectado correctamente: ${path.basename(botPath)}`));
+                console.log(chalk.green(`✅ ${priorityIcon} Sub-bot ${priority.toUpperCase()} conectado: ${botNumber}`));
+
+                // Auto-reconexión habilitada para VIP
+                if (priority === 'vip') {
+                    subBotConn.autoReconnect = true;
+                    console.log(chalk.magenta(`🔄 Auto-reconexión VIP activada para: ${botNumber}`));
+                }
             } else if (connection === 'close') {
                 const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-                console.error(chalk.red(`Sub-bot desconectado en ${path.basename(botPath)}. Razón: ${reason}`));
-                // Aquí podrías agregar lógica para reintentar la conexión de este sub-bot si es necesario
+                console.error(chalk.red(`❌ ${priorityIcon} Sub-bot ${priority.toUpperCase()} desconectado: ${botNumber}. Razón: ${reason}`));
+
+                // Auto-reconexión solo para VIP
+                if (priority === 'vip' && subBotConn.autoReconnect) {
+                    console.log(chalk.yellow(`🔄 Reintentando reconexión VIP para: ${botNumber}`));
+                    setTimeout(() => {
+                        reconnectSubBot(botPath, priority, 5000); // Reintentar en 5 segundos
+                    }, 5000);
+                }
             }
         });
+
         subBotConn.ev.on('creds.update', saveSubBotCreds);
 
-        // ¡IMPORTANTE!: Asignar el manejador de mensajes al sub-bot
-        // Asumiendo que 'handler' es el objeto importado de handler.js y contiene la función handler.
+        // Asignar el manejador de mensajes al sub-bot
         if (handler && handler.handler) {
             subBotConn.handler = handler.handler.bind(subBotConn);
             subBotConn.ev.on('messages.upsert', subBotConn.handler);
-            console.log(chalk.blue(`Manejador asignado al sub-bot: ${path.basename(botPath)}`));
+            console.log(chalk.blue(`📨 Manejador asignado al sub-bot ${priority.toUpperCase()}: ${botNumber}`));
         } else {
-            console.warn(chalk.yellow(`Advertencia: No se encontró el manejador para asignar al sub-bot: ${path.basename(botPath)}`));
+            console.warn(chalk.yellow(`⚠️ No se encontró el manejador para: ${botNumber}`));
         }
 
-        // Guarda la conexión del sub-bot en un objeto global para acceso futuro si lo necesitas
+        // Guardar la conexión del sub-bot
         if (!global.subBots) {
             global.subBots = {};
         }
-        global.subBots[path.basename(botPath)] = subBotConn;
-        
+        global.subBots[botNumber] = {
+            conn: subBotConn,
+            priority: priority,
+            autoReconnect: priority === 'vip'
+        };
+
     } catch (e) {
-        console.error(chalk.red(`Error al reconectar sub-bot en ${path.basename(botPath)}:`), e);
+        console.error(chalk.red(`❌ Error al reconectar ${priorityIcon} sub-bot ${priority.toUpperCase()} en ${botNumber}:`), e);
+
+        // Reintentar solo para VIP en caso de error
+        if (priority === 'vip') {
+            console.log(chalk.yellow(`🔄 Reintentando reconexión VIP en 10 segundos para: ${botNumber}`));
+            setTimeout(() => {
+                reconnectSubBot(botPath, priority, 10000);
+            }, 10000);
+        }
     }
+}
+
+/**
+ * Función para reconectar todos los sub-bots con prioridades
+ */
+async function reconnectAllSubBots() {
+    const rutaJadiBot = join(__dirname, './JadiBots');
+
+    if (!existsSync(rutaJadiBot)) {
+        console.log(chalk.red('❌ No existe la carpeta JadiBots'));
+        return;
+    }
+
+    const readRutaJadiBot = readdirSync(rutaJadiBot);
+    if (readRutaJadiBot.length === 0) {
+        console.log(chalk.yellow('⚠️ No hay sub-bots para reconectar'));
+        return;
+    }
+
+    console.log(chalk.bold.cyan('🚀 Iniciando reconexión por prioridades...'));
+
+    const vipBots = [];
+    const freeBots = [];
+    const credsFile = 'creds.json';
+
+    // Clasificar bots por tipo
+    for (const subBotDir of readRutaJadiBot) {
+        const botPath = join(rutaJadiBot, subBotDir);
+        const readBotPath = readdirSync(botPath);
+
+        if (readBotPath.includes(credsFile)) {
+            const botNumber = subBotDir.replace(/[^0-9]/g, '');
+            const isVip = global.premiumSubBots?.includes(botNumber);
+
+            if (isVip) {
+                vipBots.push(botPath);
+            } else {
+                freeBots.push(botPath);
+            }
+        }
+    }
+
+    console.log(chalk.bold.magenta(`💎 Sub-bots VIP encontrados: ${vipBots.length}`));
+    console.log(chalk.bold.blue(`🆓 Sub-bots gratuitos encontrados: ${freeBots.length}`));
+
+    // 1. Reconectar bots VIP primero (prioridad alta)
+    console.log(chalk.bold.magenta('💎 Fase 1: Reconectando sub-bots VIP...'));
+    for (let i = 0; i < vipBots.length; i++) {
+        const delay = i * 2000; // 2 segundos entre cada VIP
+        reconnectSubBot(vipBots[i], 'vip', delay);
+    }
+
+    // 2. Reconectar bots gratuitos después (prioridad baja)
+    const vipReconnectionTime = vipBots.length * 2000 + 5000; // Tiempo para VIP + 5s extra
+    console.log(chalk.bold.blue(`🆓 Fase 2: Reconectando sub-bots gratuitos en ${vipReconnectionTime/1000}s...`));
+
+    setTimeout(() => {
+        for (let i = 0; i < freeBots.length; i++) {
+            const delay = i * 5000; // 5 segundos entre cada gratuito
+            reconnectSubBot(freeBots[i], 'free', delay);
+        }
+    }, vipReconnectionTime);
 }
 
 
@@ -308,30 +422,31 @@ async function connectionUpdate(update) {
   }
   if (global.db.data == null) await loadDatabase();
   if (connection === 'open') {
-    console.log(chalk.yellow('Conectado correctamente.'));
+    console.log(chalk.bold.green('🟢 Bot principal conectado correctamente'));
 
-    // --- Lógica de reconexión de sub-bots al iniciar el bot principal ---
+    // Inicializar sistema de reportes diarios VIP
+    try {
+      const { initializeDailyReports } = await import('./plugins/vip-daily-report.js')
+      initializeDailyReports()
+    } catch (e) {
+      console.log('⚠️ No se pudo inicializar reportes VIP:', e)
+    }
+
+    // --- Lógica de reconexión de sub-bots con prioridades ---
     const rutaJadiBot = join(__dirname, './JadiBots');
-    
+
     if (!existsSync(rutaJadiBot)) {
         mkdirSync(rutaJadiBot, { recursive: true });
-        console.log(chalk.bold.cyan(`La carpeta: ${rutaJadiBot} se creó correctamente.`));
+        console.log(chalk.bold.cyan(`📁 Carpeta JadiBots creada: ${rutaJadiBot}`));
     } else {
-        console.log(chalk.bold.cyan(`La carpeta: ${rutaJadiBot} ya está creada.`));
+        console.log(chalk.bold.cyan(`📁 Carpeta JadiBots encontrada: ${rutaJadiBot}`));
     }
 
-    const readRutaJadiBot = readdirSync(rutaJadiBot);
-    if (readRutaJadiBot.length > 0) {
-        const credsFile = 'creds.json';
-        for (const subBotDir of readRutaJadiBot) {
-            const botPath = join(rutaJadiBot, subBotDir);
-            const readBotPath = readdirSync(botPath);
-            if (readBotPath.includes(credsFile)) {
-                // Llama a la función para reconectar cada sub-bot
-                await reconnectSubBot(botPath);
-            }
-        }
-    }
+    // Esperar 3 segundos después de que el bot principal se conecte
+    console.log(chalk.bold.cyan('⏰ Esperando 3 segundos antes de reconectar sub-bots...'));
+    setTimeout(() => {
+        reconnectAllSubBots();
+    }, 3000);
     // --- Fin de la lógica de reconexión de sub-bots ---
 
   }
